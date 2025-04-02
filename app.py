@@ -1,122 +1,157 @@
-import os
+from flask import Flask, request, jsonify
 import cv2
 import numpy as np
-from sklearn.svm import OneClassSVM
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 from sklearn.preprocessing import StandardScaler
+import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
+import base64
+from matplotlib.colors import LinearSegmentedColormap
+from flask_cors import CORS
 
-sourceBasePath = os.path.dirname(os.path.abspath(__file__)) + '\\pathUnico\\'
-sourceFolderPath = os.path.join(sourceBasePath, 'Treino')
-destFolderPath = os.path.join(sourceBasePath, 'Teste')
-save_path = destFolderPath
-os.makedirs(destFolderPath, exist_ok=True)
+# Inicializa o app
+app = Flask(__name__)
+CORS(app)
 
-####TROCAR PARA O NOME DA MOEDA UPADA
-image_path = os.path.join(destFolderPath, 'imagem upada (exemplo).jpg')
-####TROCAR PARA O ESCOLHIDO NO MENU
-moeda = "10"
-####DEBUG
-debug = True
+# Config de diretórios
+sourceBasePath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pathUnico')
+train_base_path = os.path.join(sourceBasePath, 'Treino')
 
-train_path = os.path.join(sourceBasePath, 'Treino', moeda)
-
-def preProcess(image_path, output_path, debug=False):
-    imgName = os.path.basename(image_path)
-    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+# Preprocessamento (reutilizável para treino e teste)
+def preProcess_image(image):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(image)
-
-    # Thresholding adaptativo para segmentação robusta
     thresh = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY_INV, 11, 2)
-
-    # Encontrar contornos
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     if not contours:
-        print(f"Nenhum contorno detectado em {imgName}, imagem ignorada.")
-        return
-
-    largest_contour = max(contours, key=cv2.contourArea)
-    (x, y), r = cv2.minEnclosingCircle(largest_contour)
-    x, y, r = int(x), int(y), int(r)
-
+        return None, None
+    (x, y), r = cv2.minEnclosingCircle(max(contours, key=cv2.contourArea))
     mask = np.zeros_like(image, dtype=np.uint8)
-    cv2.circle(mask, (x, y), r, (255, 255, 255), thickness=-1)
-
+    cv2.circle(mask, (int(x), int(y)), int(r), 255, thickness=-1)
     result = cv2.bitwise_and(enhanced, enhanced, mask=mask)
+    return result, mask
 
-    if debug:
-        debug_img = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        cv2.circle(debug_img, (x, y), r, (0, 255, 0), 2)
-        cv2.imwrite(os.path.join(output_path, imgName + '_debug.png'), debug_img)
+# Carregar e preprocessar imagens de treino
 
-    cv2.imwrite(os.path.join(output_path, imgName), result)
-
-preProcess(image_path, destFolderPath, debug)
-
-def load_images_from_folder(folder):
+def load_and_preprocess_train_images(base_folder, coin_type):
     images = []
+    folder = os.path.join(base_folder, str(coin_type))
+    if not os.path.exists(folder):
+        return np.array(images)
     for filename in os.listdir(folder):
         img_path = os.path.join(folder, filename)
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if img is not None:
-            img = cv2.resize(img, (256, 256))
-            images.append(img.flatten())
+        image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if image is not None:
+            preprocessed, _ = preProcess_image(image)
+            if preprocessed is not None:
+                preprocessed = cv2.resize(preprocessed, (256, 256))
+                images.append(preprocessed.flatten())
     return np.array(images)
 
-train_images = load_images_from_folder(train_path)
-scaler = StandardScaler()
-train_images_scaled = scaler.fit_transform(train_images)
-
-mean_normal_image = np.mean(train_images_scaled, axis=0).reshape(256, 256)
-
-thresh_anomaly_score = 0.60  
-max_anomaly_score = 1.8  
-
+# Thresholds
+thresh_anomaly_score = 1.9
+max_anomaly_score = 4
 cmap = LinearSegmentedColormap.from_list("anomaly_cmap", ["green", "yellow", "red"])
 
-image_name = os.path.basename(image_path)
+def preProcess(img_array):
+    image = cv2.imdecode(np.frombuffer(img_array, np.uint8), cv2.IMREAD_GRAYSCALE)
+    result, mask = preProcess_image(image)
+    return image, result, mask
 
-if image_path is not None:
-    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    test_image_resized = cv2.resize(image, (256, 256))
-    test_image_flat = scaler.transform(test_image_resized.flatten().reshape(1, -1))
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.json['image']
+    coin_type = request.json.get('coin_type', '50')
+    img_data = base64.b64decode(data)
 
-    diff_image = np.abs(test_image_flat.reshape(256, 256) - mean_normal_image)
-    anomaly_score = np.mean(diff_image)
+    train_images = load_and_preprocess_train_images(train_base_path, coin_type)
+    if train_images.size == 0:
+        return jsonify({'error': 'Sem imagens de treino para a moeda especificada.'}), 400
+
+    scaler = StandardScaler()
+    train_images_scaled = scaler.fit_transform(train_images)
+    mean_normal_image_scaled = np.mean(train_images_scaled, axis=0).reshape(256, 256)
+    mean_normal_image_raw = np.mean(train_images, axis=0).reshape(256, 256)
+
+    original, processed, mask = preProcess(img_data)
+    if processed is None:
+        return jsonify({'error': 'Falha no processamento da imagem.'}), 400
+
+    resized = cv2.resize(processed, (256, 256))
+    mask_resized = cv2.resize(mask, (256, 256)) // 255
+    test_flat = resized.flatten().reshape(1, -1)
+    test_flat_scaled = scaler.transform(test_flat)
+    diff_image_scaled = np.abs(test_flat_scaled.reshape(256, 256) - mean_normal_image_scaled)
+    diff_image_raw = np.abs(resized.astype(np.float32) - mean_normal_image_raw)
+    diff_image_raw *= mask_resized
+
+    anomaly_score = float(np.mean(diff_image_scaled))
     normalized_score = np.clip(anomaly_score / max_anomaly_score, 0, 1)
 
     if anomaly_score <= thresh_anomaly_score:
         label = "Pouco Desgastada"
-    elif anomaly_score < 0.9:
+    elif anomaly_score < 2.9:
         label = "Desgastada"
     else:
         label = "Muito Desgastada"
 
-    fig = plt.figure(figsize=(5, 6))
-    ax_img = fig.add_axes([0.1, 0.25, 0.8, 0.7])
-    ax_img.imshow(test_image_resized, cmap='gray')
-    ax_img.set_title(f"{label}\nScore: {anomaly_score:.3f}")
-    ax_img.axis('off')
-
-
-
-    # Barra de gradiente personalizada
-    ax_bar = fig.add_axes([0.1, 0.1, 0.8, 0.05])
+    # Gerar imagem da barra
+    fig, ax = plt.subplots(figsize=(4, 1.2))
     bar_img = np.linspace(0, 1, 256).reshape(1, -1)
-    ax_bar.imshow(bar_img, cmap=cmap, aspect='auto')
-    ax_bar.set_xticks([])
-    ax_bar.set_yticks([])
-    ax_bar.set_title("Nível de Anomalia", fontsize=10)
+    ax.imshow(bar_img, cmap=cmap, aspect='auto')
+    ax.axvline(x=int(normalized_score * 256), color='black', linewidth=2)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title("Nível de Desgaste")
 
-    # Indicador da posição na barra
-    marker_pos = int(normalized_score * 256)
-    ax_bar.plot([marker_pos, marker_pos], [0, 1], color='black', linewidth=2, transform=ax_bar.get_xaxis_transform(), clip_on=False)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    gradiente_base64 = base64.b64encode(buf.read()).decode('utf-8')
 
-    result_path = os.path.join(save_path, f"{image_name}_resultado.png")
-    plt.savefig(result_path, bbox_inches='tight')
-    plt.close()
+    # Gerar mapa de diferença absoluta (diff map)
+    fig3, ax3 = plt.subplots(figsize=(5, 5))
+    diffmap = ax3.imshow(diff_image_raw, cmap='hot', interpolation='nearest')
+    plt.colorbar(diffmap, ax=ax3, fraction=0.046, pad=0.04)
+    ax3.set_title("Mapa de Diferença Absoluta")
+    ax3.axis('off')
 
-    print(f"Imagem {image_name}: {label} - Anomaly score: {anomaly_score:.3f}")
+    buf3 = io.BytesIO()
+    plt.savefig(buf3, format='png', bbox_inches='tight')
+    plt.close(fig3)
+    buf3.seek(0)
+    diffmap_base64 = base64.b64encode(buf3.read()).decode('utf-8')
+
+    # Gerar heatmap da diferença visual real
+    fig2, ax2 = plt.subplots(figsize=(5, 5))
+    heatmap = ax2.imshow(diff_image_raw, cmap='coolwarm', interpolation='nearest')
+    plt.colorbar(heatmap, ax=ax2, fraction=0.046, pad=0.04)
+    ax2.set_title("Mapa de Calor")
+    ax2.axis('off')
+
+    buf2 = io.BytesIO()
+    plt.savefig(buf2, format='png', bbox_inches='tight')
+    plt.close(fig2)
+    buf2.seek(0)
+    heatmap_base64 = base64.b64encode(buf2.read()).decode('utf-8')
+
+    def encode_image(img):
+        _, buffer = cv2.imencode('.png', img)
+        return base64.b64encode(buffer).decode('utf-8')
+
+    return jsonify({
+        'label': label,
+        'score': anomaly_score,
+        'original_base64': encode_image(original),
+        'preprocessed_base64': encode_image(processed),
+        'gradiente_base64': gradiente_base64,
+        'heatmap_base64': heatmap_base64,
+        'diffmap_base64': diffmap_base64
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
