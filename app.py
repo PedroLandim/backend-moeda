@@ -10,8 +10,8 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from modelos.preProcess import preProcess
-from modelos.oneClass import load_images_from_folder, scaler, mean_normal_image, thresh_anomaly_score, max_anomaly_score
+from preProcess import preProcess
+from oneClass import load_images_from_folder, scaler, mean_normal_image, thresh_anomaly_score, max_anomaly_score
 app = Flask(__name__)
 
 cmap = LinearSegmentedColormap.from_list("anomaly_cmap", ["green", "yellow", "red"])
